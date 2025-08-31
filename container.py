@@ -3,8 +3,19 @@ import os
 import sys
 import subprocess
 import time
-
+import shutil
 CGROUP_PATH = "/sys/fs/cgroup/mycontainer"
+
+def cleanup_cgroup():
+    """Remove cgroup after container stops."""
+    try:
+        if os.path.exists(CGROUP_PATH):
+            shutil.rmtree(CGROUP_PATH)
+            print(f"Cleaned up cgroup {CGROUP_PATH}")
+    except Exception as e:
+        print(f"Error cleaning up cgroup: {e}")
+
+
 
 def setup_cgroup(cpu_max="100000 100000", memory_max="100M"):
     """Create and configure cgroup with CPU and memory limits."""
@@ -77,6 +88,7 @@ def run_container(command):
     telemetry_loop()
 
     proc.wait()
+    cleanup_cgroup()
 
 def main():
     if len(sys.argv) < 2:
