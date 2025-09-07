@@ -4,8 +4,11 @@ import sys
 import subprocess
 import time
 import shutil
+import argparse
+
 CGROUP_PATH = "/sys/fs/cgroup/mycontainer"
 
+# ---------------- Cgroup Setup ----------------
 def cleanup_cgroup():
     """Remove cgroup after container stops."""
     try:
@@ -15,18 +18,16 @@ def cleanup_cgroup():
     except Exception as e:
         print(f"Error cleaning up cgroup: {e}")
 
-
-
 def setup_cgroup(cpu_max="100000 100000", memory_max="100M"):
     """Create and configure cgroup with CPU and memory limits."""
     try:
         os.makedirs(CGROUP_PATH, exist_ok=True)
 
-        # Set CPU quota (period=100000, quota=100000 → 100% of 1 core)
+        # CPU quota
         with open(f"{CGROUP_PATH}/cpu.max", "w") as f:
             f.write(cpu_max)
 
-        # Set memory limit
+        # Memory limit
         with open(f"{CGROUP_PATH}/memory.max", "w") as f:
             f.write(memory_max)
 
@@ -43,37 +44,79 @@ def add_to_cgroup(pid):
     except Exception as e:
         print(f"Error adding process to cgroup: {e}")
 
-def telemetry_loop():
-    """Monitor usage and dynamically scale resources."""
-    print("\n[Telemetry Loop] Monitoring...")
-    while True:
-        try:
-            # Read CPU stats
-            with open(f"{CGROUP_PATH}/cpu.stat") as f:
-                cpu_stats = f.read()
+# ---------------- Telemetry with CPU% & Memory% ----------------
+def read_stats():
+    """
+    Return current CPU and memory stats as a dict:
+    - cpu_usage_usec: CPU time used in microseconds
+    - memory_bytes: current memory usage
+    - memory_percent: % of memory limit used
+    """
+    try:
+        # Memory
+        with open(f"{CGROUP_PATH}/memory.current") as f:
+            mem_usage = int(f.read())
+        with open(f"{CGROUP_PATH}/memory.max") as f:
+            mem_limit_str = f.read().strip()
+            if mem_limit_str.endswith("M"):
+                mem_limit = int(mem_limit_str[:-1]) * 1024 * 1024
+            elif mem_limit_str.endswith("G"):
+                mem_limit = int(mem_limit_str[:-1]) * 1024 * 1024 * 1024
+            else:
+                mem_limit = int(mem_limit_str)
+        mem_percent = (mem_usage / mem_limit) * 100 if mem_limit > 0 else 0
 
-            # Read memory usage
-            with open(f"{CGROUP_PATH}/memory.current") as f:
-                mem_usage = int(f.read())
+        # CPU
+        with open(f"{CGROUP_PATH}/cpu.stat") as f:
+            lines = f.readlines()
+            usage_usec = 0
+            for line in lines:
+                if line.startswith("usage_usec"):
+                    usage_usec = int(line.strip().split()[1])
 
-            print(f"CPU: {cpu_stats.strip()} | Memory: {mem_usage / (1024*1024):.2f} MB")
+        return {"cpu_usage_usec": usage_usec, "memory_bytes": mem_usage, "memory_percent": mem_percent}
+    except Exception as e:
+        print(f"Error reading stats: {e}")
+        return {"cpu_usage_usec": 0, "memory_bytes": 0, "memory_percent": 0}
 
-            # Dynamic scaling: if memory > 80 MB, increase limit
-            if mem_usage > 80 * 1024 * 1024:
+def telemetry_loop(interval=2, memory_scale_threshold=80, scale_to="200M"):
+    """
+    Monitor cgroup usage and dynamically scale memory.
+    interval: seconds between measurements
+    memory_scale_threshold: memory usage threshold in MB
+    scale_to: memory limit after scaling
+    """
+    print(f"\n[Telemetry] Monitoring every {interval}s... (Press Ctrl+C to stop)")
+    prev_cpu_usage = None
+    try:
+        while True:
+            stats = read_stats()
+            mem_mb = stats["memory_bytes"] / (1024*1024)
+            mem_pct = stats["memory_percent"]
+
+            # Compute CPU % of 1 core
+            cpu_pct = 0
+            if prev_cpu_usage is not None:
+                cpu_delta_usec = stats["cpu_usage_usec"] - prev_cpu_usage
+                cpu_pct = (cpu_delta_usec / (interval * 1_000_000)) * 100
+            prev_cpu_usage = stats["cpu_usage_usec"]
+
+            print(f"CPU Usage: {cpu_pct:.2f}% | Memory: {mem_mb:.2f} MB ({mem_pct:.1f}%)", end="\r")
+
+            # Dynamic memory scaling
+            if mem_mb > memory_scale_threshold:
                 with open(f"{CGROUP_PATH}/memory.max", "w") as f:
-                    f.write("200M")
-                print("Scaled memory to 200M")
+                    f.write(scale_to)
+                print(f"\n[Scaling] Memory scaled to {scale_to}")
 
-            time.sleep(2)
-        except KeyboardInterrupt:
-            print("Telemetry loop stopped.")
-            break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nTelemetry loop stopped.")
 
-def run_container(command):
+# ---------------- Container Runner ----------------
+def run_container(command, interval=2):
     """Run process inside namespaces and apply cgroup limits."""
     setup_cgroup()
-
-    # Launch container process
     proc = subprocess.Popen([
         "unshare",
         "--fork", "--pid", "--mount-proc",
@@ -81,27 +124,52 @@ def run_container(command):
         "bash", "-c", f"hostname container && {command}"
     ])
 
-    # Attach to cgroup
     add_to_cgroup(proc.pid)
-
-    # Start telemetry
-    telemetry_loop()
-
+    telemetry_loop(interval)
     proc.wait()
     cleanup_cgroup()
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python3 container.py <command>")
-        print("  python3 container.py --demo")
-        sys.exit(1)
+# ---------------- CLI Tool ----------------
+def cli_stats(interval=2):
+    """Standalone CLI to print current usage."""
+    print(f"Showing live cgroup stats every {interval}s (Press Ctrl+C to exit)")
+    prev_cpu_usage = None
+    try:
+        while True:
+            stats = read_stats()
+            mem_mb = stats["memory_bytes"] / (1024*1024)
+            mem_pct = stats["memory_percent"]
 
-    if sys.argv[1] == "--demo":
-        run_container("stress-ng --cpu 1 --vm 1 --vm-bytes 50M --timeout 20")
+            cpu_pct = 0
+            if prev_cpu_usage is not None:
+                cpu_delta_usec = stats["cpu_usage_usec"] - prev_cpu_usage
+                cpu_pct = (cpu_delta_usec / (interval * 1_000_000)) * 100
+            prev_cpu_usage = stats["cpu_usage_usec"]
+
+            print(f"CPU Usage: {cpu_pct:.2f}% | Memory: {mem_mb:.2f} MB ({mem_pct:.1f}%)", end="\r")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nExiting CLI stats.")
+
+# ---------------- Main ----------------
+def main():
+    parser = argparse.ArgumentParser(description="Container runtime with telemetry")
+    parser.add_argument("command", nargs="*", help="Command to run inside container")
+    parser.add_argument("--demo", action="store_true", help="Run demo stress-ng workload")
+    parser.add_argument("--interval", type=int, default=2, help="Telemetry interval in seconds")
+    parser.add_argument("--stats", action="store_true", help="Run standalone telemetry CLI")
+    args = parser.parse_args()
+
+    if args.stats:
+        cli_stats(interval=args.interval)
+        return
+
+    if args.demo:
+        run_container("stress-ng --cpu 1 --vm 1 --vm-bytes 50M --timeout 20", interval=args.interval)
+    elif args.command:
+        run_container(" ".join(args.command), interval=args.interval)
     else:
-        command = " ".join(sys.argv[1:])
-        run_container(command)
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
