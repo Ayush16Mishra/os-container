@@ -1,133 +1,322 @@
 #!/usr/bin/env python3
-import os, sys, subprocess, time, psutil
+"""
+container_runtime.py
+---------------------
+Mini container runtime using Linux namespaces + cgroups v2.
 
-CGROUP_PATH = "/sys/fs/cgroup/mycontainer"
-MEM_THRESHOLD_MB = 80
-MEM_SCALE_MB = 200
-CPU_SCALE_QUOTA = "200000 100000"
+Implements:
+- Container isolation (PID, UTS, Mount, Network namespaces)
+- Per-container cgroups for CPU/memory limits
+- Dynamic scaling policies (CPU/memory)
+- YAML configuration & structured JSON logging
+- Optional shared/isolated network modes
+- Metrics recorded to CSV
+- Basic curses dashboard (fallback to console)
+- Graceful cleanup, zombie reaping, and demo runner
 
-def setup_cgroup(cpu_max="100000 100000", memory_max="100M"):
-    os.makedirs(CGROUP_PATH, exist_ok=True)
-    with open(f"{CGROUP_PATH}/cpu.max", "w") as f:
-        f.write(cpu_max)
-    with open(f"{CGROUP_PATH}/memory.max", "w") as f:
-        f.write(memory_max)
-    print(f"Cgroup {CGROUP_PATH} setup with CPU={cpu_max}, Memory={memory_max}")
+Usage examples:
+---------------
+sudo ./container_runtime.py run --cmd "python3 myscript.py" --mem 200M --cpu "200000 100000"
+sudo ./container_runtime.py list
+sudo ./container_runtime.py kill --id <cid>
+sudo ./container_runtime.py dashboard
+sudo ./container_runtime.py demo
+"""
 
-def add_to_cgroup(pid):
-    try:
-        with open(f"{CGROUP_PATH}/cgroup.procs", "w") as f:
-            f.write(str(pid))
-        parent = psutil.Process(pid)
-        for child in parent.children(recursive=True):
-            with open(f"{CGROUP_PATH}/cgroup.procs", "w") as f:
-                f.write(str(child.pid))
-        print(f"Added PID {pid} and children to {CGROUP_PATH}")
-    except Exception as e:
-        print(f"Error adding PID to cgroup: {e}")
+import os, sys, time, json, yaml, csv, signal, subprocess, threading, logging, shutil, uuid
+from pathlib import Path
+from collections import defaultdict
 
-def telemetry_loop(interval=2):
-    prev_cpu = 0
-    print("\n[Telemetry Loop] Monitoring...")
-    while True:
+try:
+    import psutil
+except ImportError:
+    psutil = None
+try:
+    import curses
+    HAS_CURSES = True
+except ImportError:
+    HAS_CURSES = False
+
+LOG = logging.getLogger("runtime")
+LOG.setLevel(logging.INFO)
+LOG.addHandler(logging.StreamHandler(sys.stdout))
+
+# ---------------------------
+# Config & Globals
+# ---------------------------
+DEFAULT_CONFIG = {
+    "thresholds": {
+        "mem_up_mb": 200,
+        "mem_down_mb": 100,
+        "mem_trigger_up_mb": 80,
+        "mem_trigger_down_mb": 40,
+        "cpu_up_ms": 1500,
+        "cpu_down_ms": 500,
+        "cpu_scale_up": "200000 100000",
+        "cpu_scale_down": "100000 100000",
+    },
+    "general": {
+        "telemetry_interval": 2,
+        "cooldown_secs": 5,
+        "record_metrics": True,
+        "metrics_dir": "/tmp/container_metrics",
+        "cgroup_base": "/sys/fs/cgroup",
+    }
+}
+
+containers = {}
+containers_lock = threading.Lock()
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def structured_log(event, cid=None, **kwargs):
+    payload = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event}
+    if cid: payload["cid"] = cid
+    payload.update(kwargs)
+    LOG.info(json.dumps(payload))
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def cgroup_path(cid, cfg): return os.path.join(cfg["general"]["cgroup_base"], f"mycontainer-{cid}")
+
+def load_config(path="config.yaml"):
+    cfg = DEFAULT_CONFIG.copy()
+    if Path(path).exists():
         try:
-            with open(f"{CGROUP_PATH}/cpu.stat") as f:
-                stats = {line.split()[0]: int(line.split()[1]) for line in f}
-            cpu_usage = stats.get("usage_usec", 0)
-            cpu_delta = cpu_usage - prev_cpu
-            prev_cpu = cpu_usage
-
-            with open(f"{CGROUP_PATH}/memory.current") as f:
-                mem_usage = int(f.read())
-
-            pids = []
-            try:
-                with open(f"{CGROUP_PATH}/cgroup.procs") as f:
-                    pids = [int(line.strip()) for line in f if line.strip().isdigit()]
-            except:
-                pass
-            per_process = []
-            for pid in pids:
-                try:
-                    p = psutil.Process(pid)
-                    per_process.append(f"{pid}: CPU={p.cpu_percent()/psutil.cpu_count():.1f}% MEM={p.memory_info().rss/1024/1024:.1f}MB")
-                except:
-                    continue
-
-            print(f"CPU: {cpu_delta/1000:.2f} ms | Memory: {mem_usage/1024/1024:.2f} MB")
-            if per_process:
-                print("Per-process stats: " + ", ".join(per_process))
-
-            if mem_usage > MEM_THRESHOLD_MB * 1024 * 1024:
-                with open(f"{CGROUP_PATH}/memory.max", "w") as f:
-                    f.write(f"{MEM_SCALE_MB}M")
-                print(f"Scaled memory to {MEM_SCALE_MB} MB")
-            if cpu_delta / 1000 > 1500:
-                with open(f"{CGROUP_PATH}/cpu.max", "w") as f:
-                    f.write(CPU_SCALE_QUOTA)
-                print(f"Scaled CPU quota to {CPU_SCALE_QUOTA}")
-
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            print("Telemetry loop stopped.")
-            break
-
-def run_container(command, interval=2):
-    setup_cgroup()
-    proc = subprocess.Popen([
-        "unshare", "--fork", "--pid", "--mount-proc", "--uts", "--mount", "--net",
-        "bash", "-c", f"hostname container && {command}"
-    ])
-    time.sleep(0.5)
-    add_to_cgroup(proc.pid)
-    telemetry_loop(interval)
-    proc.wait()
-    try: os.rmdir(CGROUP_PATH)
-    except: pass
-
-def week1_demo():
-    print("\n=== Week 1: Namespace Isolation Demo ===")
-    print("This demonstrates PID, UTS, mount, and network namespace isolation.\n")
-    print("Running bash inside container...")
-    run_container("bash", interval=2)
-    print("\nExplanation:")
-    print("Hostname changed to 'container' → UTS namespace isolation")
-    print("PID inside container is isolated → PID namespace")
-    print("/proc is remounted → mount namespace")
-    print("Network interfaces are separate → net namespace")
-
-def week2_demo():
-    print("\n=== Week 2: Resource Limits + Dynamic Scaling Demo ===")
-    print("Demonstrates cgroups for CPU/memory, telemetry, and dynamic scaling.\n")
-    run_container("stress-ng --cpu 1 --vm 1 --vm-bytes 50M --timeout 20", interval=2)
-    print("\nExplanation:")
-    print("CPU & memory cgroups applied")
-    print("Telemetry loop shows live CPU and memory usage")
-    print("Dynamic scaling occurs if thresholds exceeded")
-
-def week3_demo():
-    print("\n=== Week 3: Enhanced Telemetry Demo ===")
-    print("Demonstrates per-process stats, interval configs, and monitoring CLI.\n")
-    run_container("stress-ng --cpu 1 --vm 1 --vm-bytes 50M --timeout 20", interval=2)
-    print("\nExplanation:")
-    print("Per-process CPU and memory printed every interval")
-    print("Includes child processes")
-    print("Interval configurable using --interval N")
-    print("Can monitor running container using --stats mode")
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 container.py --week1|--week2|--week3")
-        sys.exit(1)
-
-    if sys.argv[1] == "--week1":
-        week1_demo()
-    elif sys.argv[1] == "--week2":
-        week2_demo()
-    elif sys.argv[1] == "--week3":
-        week3_demo()
+            with open(path) as f:
+                user = yaml.safe_load(f) or {}
+            cfg["thresholds"].update(user.get("thresholds", {}))
+            cfg["general"].update(user.get("general", {}))
+            structured_log("config_loaded", path=path)
+        except Exception as e:
+            structured_log("config_error", error=str(e))
     else:
-        print("Invalid argument. Use --week1, --week2, or --week3.")
+        structured_log("config_default", msg="using defaults")
+    return cfg
+
+# ---------------------------
+# CGROUPS
+# ---------------------------
+def setup_cgroup(cid, cfg, cpu="100000 100000", mem="100M"):
+    path = cgroup_path(cid, cfg)
+    ensure_dir(path)
+    try:
+        with open(os.path.join(path, "cpu.max"), "w") as f: f.write(cpu)
+        with open(os.path.join(path, "memory.max"), "w") as f: f.write(mem)
+        structured_log("cgroup_created", cid, cpu=cpu, mem=mem)
+    except Exception as e:
+        structured_log("cgroup_error", cid, error=str(e))
+    return path
+
+def add_pid_to_cgroup(cid, pid, cfg):
+    try:
+        path = cgroup_path(cid, cfg)
+        with open(os.path.join(path, "cgroup.procs"), "w") as f: f.write(str(pid))
+        if psutil:
+            for ch in psutil.Process(pid).children(recursive=True):
+                with open(os.path.join(path, "cgroup.procs"), "w") as f: f.write(str(ch.pid))
+    except Exception as e:
+        structured_log("cgroup_add_error", cid, error=str(e))
+
+def remove_cgroup(path, cid):
+    try:
+        if os.path.exists(path): shutil.rmtree(path)
+    except Exception as e:
+        structured_log("cgroup_remove_error", cid, error=str(e))
+
+# ---------------------------
+# TELEMETRY
+# ---------------------------
+def read_stats(path):
+    cpu, mem = 0, 0
+    try:
+        with open(os.path.join(path, "cpu.stat")) as f:
+            for line in f:
+                k, v = line.split()
+                if k == "usage_usec": cpu = int(v)
+        with open(os.path.join(path, "memory.current")) as f:
+            mem = int(f.read().strip())
+    except: pass
+    return cpu, mem
+
+def telemetry(cid, cfg):
+    t = cfg["general"]["telemetry_interval"]
+    thresh, path = cfg["thresholds"], cgroup_path(cid, cfg)
+    prev_cpu, peak_cpu, peak_mem = None, 0, 0
+    cooldown = cfg["general"]["cooldown_secs"]
+    last_scale = 0
+    metrics_dir = cfg["general"]["metrics_dir"]
+    ensure_dir(metrics_dir)
+    file = os.path.join(metrics_dir, f"{cid}.csv")
+
+    with open(file, "w", newline="") as f:
+        csv.writer(f).writerow(["time", "cpu_ms", "mem_mb", "cpu.max", "mem.max"])
+
+    while True:
+        with containers_lock:
+            info = containers.get(cid)
+            if not info or info["stop_event"].is_set():
+                break
+        cpu, mem = read_stats(path)
+        delta = 0 if prev_cpu is None else max(0, cpu - prev_cpu)
+        prev_cpu = cpu
+        cpu_ms = delta / 1000.0
+        mem_mb = mem / (1024 * 1024)
+        peak_cpu, peak_mem = max(peak_cpu, cpu_ms), max(peak_mem, mem_mb)
+
+        structured_log("telemetry", cid, cpu_ms=cpu_ms, mem_mb=mem_mb)
+        with open(file, "a", newline="") as f:
+            csv.writer(f).writerow([time.strftime("%H:%M:%S"), f"{cpu_ms:.3f}", f"{mem_mb:.3f}"])
+
+        now = time.time()
+        if now - last_scale >= cooldown:
+            try:
+                if mem_mb > thresh["mem_trigger_up_mb"]:
+                    with open(os.path.join(path, "memory.max"), "w") as f: f.write(f"{thresh['mem_up_mb']}M")
+                elif mem_mb < thresh["mem_trigger_down_mb"]:
+                    with open(os.path.join(path, "memory.max"), "w") as f: f.write(f"{thresh['mem_down_mb']}M")
+                if cpu_ms > thresh["cpu_up_ms"]:
+                    with open(os.path.join(path, "cpu.max"), "w") as f: f.write(thresh["cpu_scale_up"])
+                elif cpu_ms < thresh["cpu_down_ms"]:
+                    with open(os.path.join(path, "cpu.max"), "w") as f: f.write(thresh["cpu_scale_down"])
+                last_scale = now
+            except: pass
+        time.sleep(t)
+    containers[cid]["peaks"] = (peak_cpu, peak_mem)
+    structured_log("telemetry_end", cid, peak_cpu=peak_cpu, peak_mem=peak_mem)
+
+# ---------------------------
+# LIFECYCLE
+# ---------------------------
+def run_container(cmd, cfg, cpu, mem, net_mode):
+    cid = uuid.uuid4().hex[:6]
+    cpath = setup_cgroup(cid, cfg, cpu, mem)
+    stop_event = threading.Event()
+    net_flag = [] if net_mode == "shared" else ["--net"]
+    unshare = ["unshare", "--fork", "--pid", "--mount-proc", "--uts", "--mount"] + net_flag + \
+               ["bash", "-c", f"hostname {cid} && {cmd}"]
+
+    try:
+        proc = subprocess.Popen(unshare)    
+    except Exception as e:
+        structured_log("launch_error", cid, error=str(e))
+        return None
+
+    add_pid_to_cgroup(cid, proc.pid, cfg)
+    entry = {"pid": proc, "cmd": cmd, "start_time": time.time(), "stop_event": stop_event,
+             "cgroup": cpath, "peaks": (0, 0)}
+    with containers_lock:
+        containers[cid] = entry
+
+    threading.Thread(target=telemetry, args=(cid, cfg), daemon=True).start()
+    structured_log("started", cid, pid=proc.pid, net=net_mode)
+    return cid
+
+def list_containers():
+    print(f"{'CID':8} {'PID':6} {'STATUS':9} {'UPTIME':8} {'CPUms':8} {'MEMMB':8} CMD")
+    with containers_lock:
+        for cid, i in containers.items():
+            status = "running" if i["pid"].poll() is None else "stopped"
+            up = int(time.time() - i["start_time"])
+            pc, pm = i["peaks"]
+            print(f"{cid:8} {i['pid'].pid:<6} {status:<9} {up:<8} {pc:<8.1f} {pm:<8.1f} {i['cmd']}")
+
+def kill_container(cid):
+    with containers_lock:
+        info = containers.get(cid)
+        if not info: print("No such container"); return
+    info["stop_event"].set()
+    try:
+        if info["pid"].poll() is None:
+            info["pid"].terminate(); info["pid"].wait(timeout=3)
+    except: info["pid"].kill()
+    remove_cgroup(info["cgroup"], cid)
+    with containers_lock: del containers[cid]
+    structured_log("killed", cid)
+
+# ---------------------------
+# DASHBOARD
+# ---------------------------
+def dashboard(cfg):
+    def _draw(stdscr):
+        curses.curs_set(0)
+        while True:
+            stdscr.erase()
+            stdscr.addstr(0, 0, "Mini Container Dashboard (q to quit)")
+            r = 2
+            with containers_lock:
+                for cid, i in containers.items():
+                    status = "running" if i["pid"].poll() is None else "stopped"
+                    pc, pm = i["peaks"]
+                    stdscr.addstr(r, 0, f"{cid} | {status} | CPU:{pc:.2f} | MEM:{pm:.2f} | {i['cmd']}")
+                    r += 1
+            stdscr.refresh()
+            if stdscr.getch() == ord("q"): break
+            time.sleep(cfg["general"]["telemetry_interval"])
+    if HAS_CURSES:
+        curses.wrapper(_draw)
+    else:
+        while True:
+            os.system("clear")
+            list_containers()
+            print("\n(q) to quit")
+            if input().strip().lower() == "q": break
+
+# ---------------------------
+# DEMO
+# ---------------------------
+def demo(cfg):
+    structured_log("demo_start")
+    cmds = [
+        "stress-ng --cpu 1 --timeout 5",
+        "stress-ng --vm 1 --vm-bytes 100M --timeout 5"
+    ]
+    ids = [run_container(c, cfg, "100000 100000", "100M", "isolated") for c in cmds]
+    time.sleep(8)
+    list_containers()
+    for cid in ids:
+        if cid: kill_container(cid)
+    structured_log("demo_done")
+
+# ---------------------------
+# MAIN
+# ---------------------------
+import argparse
+def main():
+    cfg = load_config()
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="action")
+
+    r = sub.add_parser("run"); r.add_argument("--cmd", required=True)
+    r.add_argument("--cpu", default="100000 100000"); r.add_argument("--mem", default="100M")
+    r.add_argument("--net", choices=["shared", "isolated"], default="isolated")
+
+    sub.add_parser("list")
+    k = sub.add_parser("kill"); k.add_argument("--id", required=True)
+    sub.add_parser("dashboard")
+    sub.add_parser("demo")
+
+    args = p.parse_args()
+    if args.action == "run":
+        cid = run_container(args.cmd, cfg, args.cpu, args.mem, args.net)
+        print(f"Started {cid}")
+    elif args.action == "list":
+        list_containers()
+    elif args.action == "kill":
+        kill_container(args.id)
+    elif args.action == "dashboard":
+        dashboard(cfg)
+    elif args.action == "demo":
+        demo(cfg)
+    else:
+        p.print_help()
 
 if _name_ == "_main_":
+    def _sig(signum, frame):
+        structured_log("signal_exit", sig=signum)
+        for c in list(containers.keys()): kill_container(c)
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
     main()
