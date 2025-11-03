@@ -1,0 +1,15 @@
+thresholds:
+  mem_up_mb: 200
+  mem_down_mb: 100
+  cpu_up_ms: 1500
+  cpu_down_ms: 500
+  cpu_scale_up: "200000 100000"
+  cpu_scale_down: "100000 100000"
+general:
+  use_overlay: false
+  base_root: /usr/share/container-base
+  telemetry_interval: 2
+  cooldown_secs: 5
+  record_metrics: true
+  metrics_dir: /tmp/container_metrics
+  cgroup_base: /sys/fs/cgroup

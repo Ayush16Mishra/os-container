@@ -481,19 +481,33 @@ def run_container(cmd, cfg, cpu, mem, net_mode):
     cid = uuid.uuid4().hex[:6]
     cpath = setup_cgroup(cid, cfg, cpu, mem)
     stop_event = threading.Event()
+    # ---------- Network Mode Handling ----------
+    # Default to shared network unless explicitly requested
+    if net_mode not in ("shared", "isolated"):
+        net_mode = "shared"
+    
+    # Skip network namespace if ip tools or permissions missing
+    if shutil.which("ip") is None:
+        structured_log("net_skipped", cid=cid, reason="ip_not_found")
+        net_mode = "shared"
+    
     net_flag = [] if net_mode == "shared" else ["--net"]
-
-    # ---------- OverlayFS setup ----------
+    
+    # ---------- OverlayFS Setup (Optional) ----------
     overlay_root = None
     base_root = cfg.get("general", {}).get("base_root", "/usr/share/container-base")
-    use_overlay = cfg.get("general", {}).get("use_overlay", True)
-
-    if use_overlay:
+    use_overlay = bool(cfg.get("general", {}).get("use_overlay", False))  # default False now
+    
+    # Check for base root existence before mounting
+    if use_overlay and os.path.exists(base_root):
         try:
             overlay_root = prepare_overlay_root(cid, base_root, cfg)
         except Exception as e:
             structured_log("overlay_init_error", cid=cid, error=str(e))
             overlay_root = None
+    else:
+        structured_log("overlay_skipped", cid=cid, reason="disabled_or_missing_base_root")
+    
 
     # ---------- Build the command to run ----------
     if overlay_root:
@@ -938,7 +952,7 @@ def main():
     else:
         p.print_help()
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     def _sig(signum, frame):
         structured_log("signal_exit", sig=signum)
         # try to kill all tracked containers cleanly
@@ -946,12 +960,15 @@ if _name_ == "_main_":
             for c in list(containers.keys()):
                 try:
                     kill_container(load_config(), c)
-                except: pass
+                except:
+                    pass
         try:
             if os.path.exists(SOCKET_PATH):
                 os.unlink(SOCKET_PATH)
-        except: pass
+        except:
+            pass
         sys.exit(0)
+
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
     main()
